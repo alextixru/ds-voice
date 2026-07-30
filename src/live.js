@@ -382,8 +382,18 @@ export async function startLive(connection, apiKey) {
     decoder.on('error', onStreamError);
   });
 
+  // Soft-limiter вместо жёсткого клампа (как в микшере WebRTC): при перегрузе весь фрейм
+  // умножается на общий коэффициент — пропорции громкости голосов сохраняются, вместо
+  // хруста от среза по потолку. Атака мгновенная, отпускание плавное (~5% за фрейм),
+  // чтобы громкость не «дышала» между соседними фреймами.
+  const LIMIT = 32000; // небольшой запас до потолка int16
+  const RELEASE = 1.05;
+  let limiterGain = 1;
+
   // Единый «микрофон» бота: 50 фреймов/с, микс всех говорящих либо тишина
   const mixTimer = setInterval(() => {
+    limiterGain = Math.min(1, limiterGain * RELEASE);
+
     const frames = [];
     for (const [userId, u] of inputs) {
       if (u.queue.length) {
@@ -396,15 +406,27 @@ export async function startLive(connection, apiKey) {
       mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
       return;
     }
-    if (frames.length === 1) {
+    if (frames.length === 1 && limiterGain === 1) {
       mgr.sendAudioChunk(frames[0], true);
       return;
     }
-    const mixed = Buffer.alloc(FRAME_16K);
-    for (let i = 0; i < FRAME_16K; i += 2) {
+
+    // Сумма в int32 (без потерь), пик — по нему решаем, душить ли фрейм
+    const samples = FRAME_16K / 2;
+    const sums = new Int32Array(samples);
+    let peak = 0;
+    for (let i = 0; i < samples; i++) {
       let sum = 0;
-      for (const f of frames) sum += f.readInt16LE(i);
-      mixed.writeInt16LE(Math.max(-32768, Math.min(32767, sum)), i);
+      for (const f of frames) sum += f.readInt16LE(i * 2);
+      sums[i] = sum;
+      const abs = sum < 0 ? -sum : sum;
+      if (abs > peak) peak = abs;
+    }
+    if (peak * limiterGain > LIMIT) limiterGain = LIMIT / peak;
+
+    const mixed = Buffer.alloc(FRAME_16K);
+    for (let i = 0; i < samples; i++) {
+      mixed.writeInt16LE(Math.round(sums[i] * limiterGain), i * 2);
     }
     mgr.sendAudioChunk(mixed, true);
   }, 20);
