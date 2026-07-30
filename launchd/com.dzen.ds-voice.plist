@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.dzen.ds-voice</string>
+
+	<!-- Путь к node зашит под nvm: при апгрейде node версию в пути нужно обновить -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/tihn/.nvm/versions/node/v22.20.0/bin/node</string>
+		<string>src/index.js</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/tihn/ds-voice</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Перезапускать при любом падении; SuccessfulExit=false — не перезапускать при чистом выходе (launchctl bootout) -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<!-- Пауза между рестартами, чтобы при цикле падений не долбить Discord API -->
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+
+	<key>StandardOutPath</key>
+	<string>/Users/tihn/ds-voice/logs/bot.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/tihn/ds-voice/logs/bot.log</string>
+</dict>
+</plist>
