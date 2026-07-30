@@ -106,7 +106,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
-      await startLive(joined.connection, process.env.GEMINI_API_KEY);
+      await startLive(joined.connection, process.env.GEMINI_API_KEY, {
+        // Говорящий всегда в войсе гильдии, а GuildVoiceStates держит таких в кэше
+        resolveSpeakerName: (userId) =>
+          interaction.guild.members.cache.get(userId)?.displayName ?? null,
+      });
     } catch (e) {
       console.error('startLive failed:', e);
       joined.connection.destroy();

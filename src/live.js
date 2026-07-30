@@ -208,6 +208,17 @@ class LiveSessionManager {
     }, wait);
   }
 
+  // Служебный текст в живую сессию (метки говорящих). Потерять при реконнекте
+  // не страшно — не буферизуем, в отличие от речи.
+  sendText(text) {
+    if (!this.ready) return;
+    try {
+      this.session.sendRealtimeInput({ text });
+    } catch (e) {
+      console.error('send text error:', e.message);
+    }
+  }
+
   // isSpeech=false для чанков тишины: их не буферизуем и watchdog по ним не считаем
   sendAudioChunk(buf16k, isSpeech) {
     if (!this.ready) {
@@ -262,7 +273,9 @@ export function getLiveSession(guildId) {
 
 // ---- основной запуск ----
 
-export async function startLive(connection, apiKey) {
+// opts.resolveSpeakerName?: (userId) => string | null — как звать говорящего;
+// live.js про Discord-сущности не знает, имя достаёт вызывающий.
+export async function startLive(connection, apiKey, opts = {}) {
   const player = createAudioPlayer({
     behaviors: {
       noSubscriber: NoSubscriberBehavior.Pause,
@@ -349,10 +362,20 @@ export async function startLive(connection, apiKey) {
     u.rest = Buffer.alloc(0);
   };
 
+  // Метка говорящего: API не умеет диаризацию, поэтому шепчем модели текстом, кто взял
+  // слово. Только при смене спикера — иначе каждая пауза в 600мс плодила бы метку.
+  let lastLabeledSpeaker = null;
+
   receiver.speaking.on('start', (userId) => {
     if (active.has(userId)) return;
     active.add(userId);
     console.log(`live: speaking start ${userId}`);
+
+    if (userId !== lastLabeledSpeaker) {
+      lastLabeledSpeaker = userId;
+      const name = opts.resolveSpeakerName?.(userId);
+      if (name) mgr.sendText(`[говорит ${name}]`);
+    }
 
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 600 },
