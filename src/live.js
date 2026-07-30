@@ -83,7 +83,7 @@ class LiveSessionManager {
     this.attempt = 0;
     this.reconnectTimer = null;
     this.speechSinceServerMsg = 0; // watchdog-счётчик
-    this.voiceName = process.env.VOICE_NAME || 'Sulafat';
+    this.voiceName = process.env.VOICE_NAME || 'Autonoe';
     this.epoch = 0; // растёт с каждым коннектом: колбэки прошлых сессий отсеиваются
   }
 
@@ -265,10 +265,11 @@ class LiveSessionManager {
       console.error('send error:', e.message);
       return;
     }
-    if (isSpeech && ++this.speechSinceServerMsg > 3000) {
-      // ~60с живой речи без единого сообщения от сервера — сессия мертва.
-      // Порог большой сознательно: при непрерывном галдеже ход не закрывается и сервер
-      // легитимно молчит (видели ложняки на 15с), а с proactive audio молчание — норма.
+    if (isSpeech && ++this.speechSinceServerMsg > 1250) {
+      // ~25с живой речи без единого сообщения от сервера — сессия мертва (видели кому:
+      // 50с тишины при живом канале, лечилась только ручным /join). Ниже 15с нельзя —
+      // ловили ложняки; 25с безопасно: с proactivity сервер стримит транскрипции
+      // непрерывно даже в галдеже, его молчание при речи — настоящий признак смерти.
       console.log('live: watchdog — сервер молчит при живой речи, принудительный реконнект');
       this.speechSinceServerMsg = 0;
       this.#reconnectNow();
@@ -529,6 +530,16 @@ export async function startLive(connection, apiKey) {
       mgr.stop();
     }
   });
+
+  // Гонка двух /join: пока мы ждали открытия Gemini-сессии, конкурирующий joinChannel
+  // мог снести это соединение — событие destroyed выстрелило ДО навешивания обработчика
+  // выше, и никто бы не погасил сессию (зомби у Google + вечный таймер тишины).
+  if (connection.state.status === 'destroyed') {
+    clearInterval(mixTimer);
+    stopPlayback();
+    mgr.stop();
+    throw new Error('соединение уничтожено во время открытия сессии (параллельный /join?)');
+  }
 
   sessions.set(guildId, mgr);
   return mgr;

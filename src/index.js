@@ -133,7 +133,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await startLive(joined.connection, process.env.GEMINI_API_KEY);
     } catch (e) {
       console.error('startLive failed:', e);
-      joined.connection.destroy();
+      // Соединение могло уже погибнуть (гонка параллельных /join) — повторный destroy кинет
+      if (joined.connection.state.status !== 'destroyed') joined.connection.destroy();
       await interaction.editReply(`Не смог открыть Live-сессию: ${e.message}`);
       return;
     }
@@ -152,7 +153,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const arg = interaction.options.getString('имя');
     const mgr = getLiveSession(interaction.guild.id);
     if (!arg) {
-      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Sulafat');
+      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Autonoe');
       await interaction.reply({
         content: `Сейчас: **${current}**. Смена: \`/voice имя:<голос>\`\nДоступные: ${VOICES.join(', ')}`,
         flags: MessageFlags.Ephemeral,
