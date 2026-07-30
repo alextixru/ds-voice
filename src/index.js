@@ -26,6 +26,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
+// Гильдии, где разрешён войс: бот добавлен на публичные сервера с десятками тысяч людей,
+// без белого списка любой их участник may /join и выжечь квоту Gemini (и 3 одновременные
+// Live-сессии free tier). Вне списка — отказ со ссылкой на владельца.
+const GUILD_ALLOWLIST = new Set(
+  (process.env.GUILD_ALLOWLIST ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+);
+let ownerMention = 'владельцу бота';
+
 const commands = [
   new SlashCommandBuilder()
     .setName('join')
@@ -49,7 +57,15 @@ const commands = [
 
 client.once(Events.ClientReady, async (c) => {
   await c.application.commands.set(commands);
-  console.log(`Готов: ${c.user.tag}, слэш-команды зарегистрированы`);
+  // Владелец приложения — для контакта в отказе на чужих серверах
+  try {
+    const app = await c.application.fetch();
+    const owner = app.owner?.owner?.user ?? app.owner; // team или личный аккаунт
+    if (owner?.id) ownerMention = `<@${owner.id}>`;
+  } catch (e) {
+    console.error('не смог получить владельца приложения:', e.message);
+  }
+  console.log(`Готов: ${c.user.tag}, слэш-команды зарегистрированы, allowlist: ${GUILD_ALLOWLIST.size} гильдий`);
 });
 
 // interaction должен быть deferred: entersState ждёт до 15с, а на ответ даётся 3с
@@ -117,6 +133,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (!interaction.isChatInputCommand() || !interaction.guild) return;
+
+  // Войс-команды — только на разрешённых серверах (/leave не гейтим: выйти можно всегда)
+  if (
+    ['join', 'echo', 'voice'].includes(interaction.commandName) &&
+    !GUILD_ALLOWLIST.has(interaction.guild.id)
+  ) {
+    await interaction.reply({
+      content: `На этом сервере голосовой режим не подключён. Подключение платное — пишите ${ownerMention}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
 
   if (interaction.commandName === 'join') {
     if (!process.env.GEMINI_API_KEY) {
