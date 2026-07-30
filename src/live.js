@@ -55,9 +55,12 @@ function upsample24kMonoTo48kStereo(buf) {
   return out;
 }
 
-// 20 мс тишины @16k mono. Discord не шлёт пакеты, когда все молчат, а серверному VAD
+// 20 мс @16k mono s16le — единица, которой микшер шлёт звук в Gemini
+const FRAME_16K = 320 * 2;
+
+// 20 мс тишины. Discord не шлёт пакеты, когда все молчат, а серверному VAD
 // нужен непрерывный поток, чтобы засечь конец реплики — добиваем тишину сами по таймеру.
-const SILENCE_CHUNK_16K = Buffer.alloc(320 * 2);
+const SILENCE_CHUNK_16K = Buffer.alloc(FRAME_16K);
 
 // ---- менеджер Live-сессии с авто-переподключением ----
 //
@@ -303,10 +306,48 @@ export async function startLive(connection, apiKey) {
   });
   await mgr.start();
 
-  // ---- захват микрофонов канала ----
+  // ---- захват микрофонов канала + микшер ----
+  //
+  // Discord отдаёт отдельный поток на каждого говорящего. Раньше чанки летели в Gemini
+  // по мере декодирования: при одновременной речи двух людей их 20-мс куски перемешивались
+  // в один моно-поток без сложения — на том конце каша. Теперь у каждого юзера своя
+  // очередь фреймов, а единый 20-мс тикер суммирует по фрейму от каждого и шлёт микс
+  // (или тишину, когда все молчат — серверному VAD нужен непрерывный поток).
 
   const receiver = connection.receiver;
   const active = new Set();
+  const inputs = new Map(); // userId -> { rest: Buffer, queue: Buffer[] }
+  const MAX_QUEUE = 50; // ~1с на юзера: декодер бурстит, тикер разгребает в реальном темпе
+
+  const userInput = (userId) => {
+    let u = inputs.get(userId);
+    if (!u) {
+      u = { rest: Buffer.alloc(0), queue: [] };
+      inputs.set(userId, u);
+    }
+    return u;
+  };
+
+  // Декодер не обязан отдавать ровно по 20 мс — накапливаем и режем на фреймы
+  const pushAudio = (userId, pcm16k) => {
+    const u = userInput(userId);
+    u.rest = Buffer.concat([u.rest, pcm16k]);
+    while (u.rest.length >= FRAME_16K) {
+      u.queue.push(u.rest.subarray(0, FRAME_16K));
+      u.rest = u.rest.subarray(FRAME_16K);
+      if (u.queue.length > MAX_QUEUE) u.queue.shift();
+    }
+  };
+
+  // Хвост реплики короче фрейма — добиваем нулями, чтобы не потерять последние миллисекунды
+  const flushAudio = (userId) => {
+    const u = inputs.get(userId);
+    if (!u || u.rest.length === 0) return;
+    const frame = Buffer.alloc(FRAME_16K);
+    u.rest.copy(frame);
+    u.queue.push(frame);
+    u.rest = Buffer.alloc(0);
+  };
 
   receiver.speaking.on('start', (userId) => {
     if (active.has(userId)) return;
@@ -319,15 +360,14 @@ export async function startLive(connection, apiKey) {
     const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
     opusStream.pipe(decoder);
 
-    let sent = 0;
     decoder.on('data', (chunk) => {
-      mgr.sendAudioChunk(downsample48kStereoTo16kMono(chunk), true);
-      sent++;
+      pushAudio(userId, downsample48kStereoTo16kMono(chunk));
     });
 
     decoder.on('end', () => {
       active.delete(userId);
-      console.log(`live: speaking end ${userId}, отправлено чанков: ${sent}`);
+      flushAudio(userId);
+      console.log(`live: speaking end ${userId}`);
     });
 
     // Битый Opus-пакет (лаги, соундборд) не должен ронять процесс:
@@ -342,10 +382,31 @@ export async function startLive(connection, apiKey) {
     decoder.on('error', onStreamError);
   });
 
-  // Пока никто не говорит — стримим тишину (50 чанков/с), имитируя живой микрофон.
-  const silenceTimer = setInterval(() => {
-    if (active.size > 0) return;
-    mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
+  // Единый «микрофон» бота: 50 фреймов/с, микс всех говорящих либо тишина
+  const mixTimer = setInterval(() => {
+    const frames = [];
+    for (const [userId, u] of inputs) {
+      if (u.queue.length) {
+        frames.push(u.queue.shift());
+      } else if (!active.has(userId)) {
+        inputs.delete(userId); // отговорил и дослан — убираем, чтобы map не рос вечно
+      }
+    }
+    if (frames.length === 0) {
+      mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
+      return;
+    }
+    if (frames.length === 1) {
+      mgr.sendAudioChunk(frames[0], true);
+      return;
+    }
+    const mixed = Buffer.alloc(FRAME_16K);
+    for (let i = 0; i < FRAME_16K; i += 2) {
+      let sum = 0;
+      for (const f of frames) sum += f.readInt16LE(i);
+      mixed.writeInt16LE(Math.max(-32768, Math.min(32767, sum)), i);
+    }
+    mgr.sendAudioChunk(mixed, true);
   }, 20);
 
   const guildId = connection.joinConfig.guildId;
@@ -353,7 +414,7 @@ export async function startLive(connection, apiKey) {
   connection.on('stateChange', (_, newState) => {
     if (newState.status === 'destroyed') {
       sessions.delete(guildId);
-      clearInterval(silenceTimer);
+      clearInterval(mixTimer);
       stopPlayback();
       mgr.stop();
     }
