@@ -33,9 +33,17 @@ export function startEcho(connection) {
       frameSize: 960,
     });
 
+    // Кап на минуту звука (~11.5 МБ): эхо — диагностика, не магнитофон;
+    // без лимита трёхминутная музыка в канале съедала бы десятки МБ за реплику
+    const MAX_BYTES = 48000 * 4 * 60;
+    let total = 0;
     const chunks = [];
     opusStream.pipe(decoder);
-    decoder.on('data', (chunk) => chunks.push(chunk));
+    decoder.on('data', (chunk) => {
+      total += chunk.length;
+      while (total > MAX_BYTES && chunks.length) total -= chunks.shift().length;
+      chunks.push(chunk);
+    });
 
     decoder.on('end', () => {
       active.delete(userId);

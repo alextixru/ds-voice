@@ -79,6 +79,30 @@ async function joinChannel(interaction) {
     await interaction.editReply('Не смог подключиться к каналу (таймаут).');
     return null;
   }
+
+  // Слепых зон не оставляем: заходы/выходы людей дёргают войс (re-key, перенос канала),
+  // и до сих пор это было видно только как «player -> autopaused» посреди фразы.
+  connection.on('stateChange', (oldS, newS) => {
+    if (oldS.status !== newS.status) console.log(`voice: ${oldS.status} -> ${newS.status}`);
+  });
+
+  // Канонический паттерн из гайда discord.js: Disconnected ещё не смерть — даём 5с
+  // на самовосстановление (Signalling/Connecting = перенос канала или re-resume),
+  // и только если не ожило — destroy, чтобы не висеть зомби. Live-сессия погаснет
+  // сама через stateChange=destroyed.
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      console.log('voice: disconnect оказался переносом/resume — живём');
+    } catch {
+      console.log('voice: реальный дисконнект — закрываю соединение');
+      connection.destroy();
+    }
+  });
+
   return { connection, channel };
 }
 
@@ -106,11 +130,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
-      await startLive(joined.connection, process.env.GEMINI_API_KEY, {
-        // Говорящий всегда в войсе гильдии, а GuildVoiceStates держит таких в кэше
-        resolveSpeakerName: (userId) =>
-          interaction.guild.members.cache.get(userId)?.displayName ?? null,
-      });
+      await startLive(joined.connection, process.env.GEMINI_API_KEY);
     } catch (e) {
       console.error('startLive failed:', e);
       joined.connection.destroy();
@@ -132,7 +152,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const arg = interaction.options.getString('имя');
     const mgr = getLiveSession(interaction.guild.id);
     if (!arg) {
-      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Puck');
+      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Sulafat');
       await interaction.reply({
         content: `Сейчас: **${current}**. Смена: \`/voice имя:<голос>\`\nДоступные: ${VOICES.join(', ')}`,
         flags: MessageFlags.Ephemeral,

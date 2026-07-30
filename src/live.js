@@ -1,5 +1,5 @@
 import { PassThrough } from 'node:stream';
-import { GoogleGenAI, Modality } from '@google/genai';
+import { GoogleGenAI, Modality, StartSensitivity, ActivityHandling } from '@google/genai';
 import prism from 'prism-media';
 import {
   createAudioPlayer,
@@ -7,6 +7,7 @@ import {
   StreamType,
   EndBehaviorType,
   NoSubscriberBehavior,
+  AudioPlayerStatus,
 } from '@discordjs/voice';
 import { SYSTEM_INSTRUCTION } from './persona.js';
 
@@ -70,7 +71,8 @@ const SILENCE_CHUNK_16K = Buffer.alloc(FRAME_16K);
 
 class LiveSessionManager {
   constructor(apiKey, handlers) {
-    this.ai = new GoogleGenAI({ apiKey });
+    // v1alpha: proactivity (проактивное аудио) в стабильной версии API ещё не доступна
+    this.ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
     this.handlers = handlers; // { onAudio(pcm24k), onInterrupted(), onTurnComplete() }
     this.session = null;
     this.ready = false;
@@ -81,7 +83,8 @@ class LiveSessionManager {
     this.attempt = 0;
     this.reconnectTimer = null;
     this.speechSinceServerMsg = 0; // watchdog-счётчик
-    this.voiceName = process.env.VOICE_NAME || 'Puck';
+    this.voiceName = process.env.VOICE_NAME || 'Sulafat';
+    this.epoch = 0; // растёт с каждым коннектом: колбэки прошлых сессий отсеиваются
   }
 
   // Смена голоса на лету: новый voiceName применяется только при новой сессии,
@@ -102,15 +105,35 @@ class LiveSessionManager {
   }
 
   async #connect() {
+    // Колбэки ниже замыкают epoch своего коннекта: запоздавшее сообщение или close
+    // от предыдущей сессии (реконнект, смена голоса) не должно трогать новую —
+    // иначе ловим гонки вида «onclose старой сессии планирует лишний реконнект новой».
+    const epoch = ++this.epoch;
+    const isCurrent = () => epoch === this.epoch;
     this.session = await this.ai.live.connect({
       model: MODEL,
       config: {
         responseModalities: [Modality.AUDIO],
         systemInstruction: SYSTEM_INSTRUCTION,
         inputAudioTranscription: {},
+        // Модель сама решает, отвечать ли: чужие разговоры в канале слушает молча,
+        // вступает на обращение (см. персону). Лечит «отвечает на каждый чих» в галдеже.
+        proactivity: { proactiveAudio: true },
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: { voiceName: this.voiceName },
+          },
+        },
+        // Серверный VAD: LOW-чувствительность старта + 300мс подтверждения, чтобы
+        // короткие всплески (кашель, смешок, «ага») не коммитились как начало речи
+        // и не дёргали модель. Хвост речи (prefix) сервер сохраняет — начало не теряется.
+        realtimeInputConfig: {
+          // Начала говорить — договаривает: речь людей не обрывает ответ (barge-in выключен).
+          // Голосом её теперь не остановить, только /leave или дождаться конца реплики.
+          activityHandling: ActivityHandling.NO_INTERRUPTION,
+          automaticActivityDetection: {
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+            prefixPaddingMs: 300,
           },
         },
         // Бессрочная сессия: старый контекст сжимается вместо смерти по лимиту
@@ -120,22 +143,29 @@ class LiveSessionManager {
       },
       callbacks: {
         onopen: () => console.log('live: session open'),
-        onmessage: (msg) => this.#onMessage(msg),
+        onmessage: (msg) => { if (isCurrent()) this.#onMessage(msg); },
         onerror: (e) => console.error('live error:', e?.message ?? e),
-        onclose: (e) => this.#onClose(e),
+        onclose: (e) => { if (isCurrent()) this.#onClose(e); },
       },
     });
     this.ready = true;
     this.attempt = 0;
     this.speechSinceServerMsg = 0;
+    // Флаг «мы сами закрыли» не должен переживать успешный коннект: если close()
+    // старой сессии оказался no-op (она уже была мертва), onclose не придёт и флаг
+    // никто не снимет — а залипший true проглотит следующий реальный обрыв.
+    this.expectClose = false;
     this.#flushQueue();
   }
 
   #onMessage(msg) {
     this.speechSinceServerMsg = 0; // сервер жив
 
+    // Пока идёт наш собственный реконнект (смена голоса и т.п.), апдейты от умирающей
+    // сессии игнорируем: setVoice обнулил handle, и запоздалый update вернул бы его —
+    // новая сессия продолжилась бы старым голосом.
     if (msg.sessionResumptionUpdate?.resumable && msg.sessionResumptionUpdate.newHandle) {
-      this.handle = msg.sessionResumptionUpdate.newHandle;
+      if (!this.expectClose) this.handle = msg.sessionResumptionUpdate.newHandle;
     }
 
     if (msg.goAway) {
@@ -177,11 +207,21 @@ class LiveSessionManager {
     this.#scheduleReconnect();
   }
 
-  // Немедленный реконнект по нашей инициативе (GoAway, watchdog)
+  // Немедленный реконнект по нашей инициативе (GoAway, watchdog, смена голоса)
   #reconnectNow() {
+    // expectClose — только если сессия живая: close() мёртвой не породит onclose,
+    // и некому будет снять флаг
+    if (this.ready) {
+      this.expectClose = true;
+      try { this.session?.close(); } catch {}
+    }
     this.ready = false;
-    this.expectClose = true;
-    try { this.session?.close(); } catch {}
+    // Реконнект уже запланирован с backoff — заменяем его немедленным (нас просят
+    // пересоздать сессию прямо сейчас: GoAway истекает, голос сменён)
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.#scheduleReconnect(0);
   }
 
@@ -208,17 +248,6 @@ class LiveSessionManager {
     }, wait);
   }
 
-  // Служебный текст в живую сессию (метки говорящих). Потерять при реконнекте
-  // не страшно — не буферизуем, в отличие от речи.
-  sendText(text) {
-    if (!this.ready) return;
-    try {
-      this.session.sendRealtimeInput({ text });
-    } catch (e) {
-      console.error('send text error:', e.message);
-    }
-  }
-
   // isSpeech=false для чанков тишины: их не буферизуем и watchdog по ним не считаем
   sendAudioChunk(buf16k, isSpeech) {
     if (!this.ready) {
@@ -236,8 +265,10 @@ class LiveSessionManager {
       console.error('send error:', e.message);
       return;
     }
-    if (isSpeech && ++this.speechSinceServerMsg > 750) {
-      // ~15с живой речи без единого сообщения от сервера (даже транскрипции) — сессия мертва
+    if (isSpeech && ++this.speechSinceServerMsg > 3000) {
+      // ~60с живой речи без единого сообщения от сервера — сессия мертва.
+      // Порог большой сознательно: при непрерывном галдеже ход не закрывается и сервер
+      // легитимно молчит (видели ложняки на 15с), а с proactive audio молчание — норма.
       console.log('live: watchdog — сервер молчит при живой речи, принудительный реконнект');
       this.speechSinceServerMsg = 0;
       this.#reconnectNow();
@@ -273,9 +304,7 @@ export function getLiveSession(guildId) {
 
 // ---- основной запуск ----
 
-// opts.resolveSpeakerName?: (userId) => string | null — как звать говорящего;
-// live.js про Discord-сущности не знает, имя достаёт вызывающий.
-export async function startLive(connection, apiKey, opts = {}) {
+export async function startLive(connection, apiKey) {
   const player = createAudioPlayer({
     behaviors: {
       noSubscriber: NoSubscriberBehavior.Pause,
@@ -290,14 +319,25 @@ export async function startLive(connection, apiKey, opts = {}) {
   player.on('error', (e) => console.error('player error:', e.message));
 
   let currentTurn = null; // PassThrough текущего ответа модели
+  // Gemini стримит быстрее реального времени: к turnComplete в плеере остаётся
+  // недоигранный буфер. Немедленный player.play() следующего хода вытеснил бы его
+  // вместе с хвостом фразы — поэтому новые ходы ждут Idle в очереди.
+  const pendingTurns = [];
 
   const stopPlayback = () => {
     if (currentTurn) {
       currentTurn.destroy();
       currentTurn = null;
     }
+    pendingTurns.length = 0;
     player.stop(true);
   };
+
+  player.on('stateChange', (_, newS) => {
+    if (newS.status === AudioPlayerStatus.Idle && pendingTurns.length) {
+      player.play(pendingTurns.shift());
+    }
+  });
 
   const mgr = new LiveSessionManager(apiKey, {
     onAudio: (pcm24k) => {
@@ -305,7 +345,12 @@ export async function startLive(connection, apiKey, opts = {}) {
       if (!currentTurn) {
         console.log('live: модель начала отвечать, стартую воспроизведение');
         currentTurn = new PassThrough();
-        player.play(createAudioResource(currentTurn, { inputType: StreamType.Raw }));
+        const resource = createAudioResource(currentTurn, { inputType: StreamType.Raw });
+        if (player.state.status === AudioPlayerStatus.Idle && pendingTurns.length === 0) {
+          player.play(resource);
+        } else {
+          pendingTurns.push(resource); // доиграет текущий ход — возьмётся за этот
+        }
       }
       currentTurn.write(pcm48k);
     },
@@ -329,13 +374,19 @@ export async function startLive(connection, apiKey, opts = {}) {
 
   const receiver = connection.receiver;
   const active = new Set();
-  const inputs = new Map(); // userId -> { rest: Buffer, queue: Buffer[] }
+  const inputs = new Map(); // userId -> { rest, queue, gateFrames, passed } (см. гейт ниже)
   const MAX_QUEUE = 50; // ~1с на юзера: декодер бурстит, тикер разгребает в реальном темпе
+
+  // Шумовой порог: кадры юзера не идут в Gemini, пока он не наговорил MIN_SPEECH_FRAMES
+  // подряд (~240мс). Всплеск горячего микрофона при заходе в канал (дыхание, клава)
+  // умирает, не дойдя до сервера, — иначе STT галлюцинирует на нём фантомные фразы
+  // (видели японский в логах). Прошедшая порог речь досылается целиком — начало не режется.
+  const MIN_SPEECH_FRAMES = 12;
 
   const userInput = (userId) => {
     let u = inputs.get(userId);
     if (!u) {
-      u = { rest: Buffer.alloc(0), queue: [] };
+      u = { rest: Buffer.alloc(0), queue: [], gateFrames: 0, passed: false };
       inputs.set(userId, u);
     }
     return u;
@@ -362,20 +413,10 @@ export async function startLive(connection, apiKey, opts = {}) {
     u.rest = Buffer.alloc(0);
   };
 
-  // Метка говорящего: API не умеет диаризацию, поэтому шепчем модели текстом, кто взял
-  // слово. Только при смене спикера — иначе каждая пауза в 600мс плодила бы метку.
-  let lastLabeledSpeaker = null;
-
   receiver.speaking.on('start', (userId) => {
     if (active.has(userId)) return;
     active.add(userId);
     console.log(`live: speaking start ${userId}`);
-
-    if (userId !== lastLabeledSpeaker) {
-      lastLabeledSpeaker = userId;
-      const name = opts.resolveSpeakerName?.(userId);
-      if (name) mgr.sendText(`[говорит ${name}]`);
-    }
 
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 600 },
@@ -389,7 +430,18 @@ export async function startLive(connection, apiKey, opts = {}) {
 
     decoder.on('end', () => {
       active.delete(userId);
-      flushAudio(userId);
+      const u = inputs.get(userId);
+      if (u && !u.passed) {
+        // Всплеск умер, не пройдя гейт — выбрасываем целиком, до сервера он не дошёл
+        u.queue.length = 0;
+        u.rest = Buffer.alloc(0);
+      } else {
+        flushAudio(userId);
+      }
+      if (u) {
+        u.gateFrames = 0;
+        u.passed = false;
+      }
       console.log(`live: speaking end ${userId}`);
     });
 
@@ -420,6 +472,19 @@ export async function startLive(connection, apiKey, opts = {}) {
     const frames = [];
     for (const [userId, u] of inputs) {
       if (u.queue.length) {
+        if (!u.passed) {
+          if (u.gateFrames < MIN_SPEECH_FRAMES) {
+            // Испытательный срок: копим кадры в очереди, в микс не пускаем
+            u.gateFrames++;
+            continue;
+          }
+          u.passed = true;
+          // Порог пройден — досылаем накопленное начало реплики одним куском,
+          // чтобы первый слог («Ха» из «Ханами») не пропал
+          const backlog = u.queue.splice(0);
+          mgr.sendAudioChunk(Buffer.concat(backlog), true);
+          continue;
+        }
         frames.push(u.queue.shift());
       } else if (!active.has(userId)) {
         inputs.delete(userId); // отговорил и дослан — убираем, чтобы map не рос вечно
