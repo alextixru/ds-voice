@@ -115,11 +115,14 @@ class LiveSessionManager {
   // Смена голоса на лету: новый voiceName применяется только при новой сессии,
   // поэтому сбрасываем resumption handle (иначе сервер может продолжить старым голосом)
   // и форсим реконнект. Контекст разговора при этом теряется — цена смены тембра.
+  // false — менеджер уже остановлен, реконнект не случится (не врём вызывающему).
   setVoice(name) {
+    if (this.stopped) return false;
     this.voiceName = name;
     this.handle = null;
     console.log(`live: смена голоса на ${name}, пересоздаю сессию`);
     this.#reconnectNow();
+    return true;
   }
 
   async start() {
@@ -274,6 +277,17 @@ class LiveSessionManager {
   }
 }
 
+// ---- реестр сессий ----
+
+// Живёт рядом с lifecycle: сессия попадает сюда только после успешного старта
+// и удаляется при смерти connection (включая кик бота из канала модератором) —
+// снаружи невозможно получить менеджер мёртвой сессии.
+const sessions = new Map(); // guildId -> LiveSessionManager
+
+export function getLiveSession(guildId) {
+  return sessions.get(guildId);
+}
+
 // ---- основной запуск ----
 
 export async function startLive(connection, apiKey) {
@@ -365,13 +379,17 @@ export async function startLive(connection, apiKey) {
     mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
   }, 20);
 
+  const guildId = connection.joinConfig.guildId;
+
   connection.on('stateChange', (_, newState) => {
     if (newState.status === 'destroyed') {
+      sessions.delete(guildId);
       clearInterval(silenceTimer);
       stopPlayback();
       mgr.stop();
     }
   });
 
+  sessions.set(guildId, mgr);
   return mgr;
 }

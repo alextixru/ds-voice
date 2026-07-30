@@ -14,7 +14,7 @@ import {
   VoiceConnectionStatus,
 } from '@discordjs/voice';
 import { startEcho } from './echo.js';
-import { startLive, VOICES } from './live.js';
+import { startLive, getLiveSession, VOICES } from './live.js';
 
 // Последний рубеж: не даём случайной ошибке в аудио-тракте убить бота посреди разговора.
 process.on('uncaughtException', (e) => console.error('UNCAUGHT:', e));
@@ -25,9 +25,6 @@ process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e)
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
-
-// Live-менеджер по гильдии — нужен для смены голоса на лету (/voice)
-const liveSessions = new Map();
 
 const commands = [
   new SlashCommandBuilder()
@@ -62,6 +59,11 @@ async function joinChannel(interaction) {
     await interaction.editReply('Сначала зайди в голосовой канал.');
     return null;
   }
+
+  // Идемпотентность: повторный /join (или /echo поверх live) не должен навешивать
+  // второй комплект листенеров на существующий connection — joinVoiceChannel вернул бы
+  // его же. Сносим старый: его live-сессия погаснет сама через stateChange=destroyed.
+  getVoiceConnection(channel.guild.id)?.destroy();
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
@@ -104,8 +106,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
-      const mgr = await startLive(joined.connection, process.env.GEMINI_API_KEY);
-      liveSessions.set(interaction.guild.id, mgr);
+      await startLive(joined.connection, process.env.GEMINI_API_KEY);
     } catch (e) {
       console.error('startLive failed:', e);
       joined.connection.destroy();
@@ -125,7 +126,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === 'voice') {
     const arg = interaction.options.getString('имя');
-    const mgr = liveSessions.get(interaction.guild.id);
+    const mgr = getLiveSession(interaction.guild.id);
     if (!arg) {
       const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Puck');
       await interaction.reply({
@@ -143,14 +144,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
-    if (!mgr) {
+    if (!mgr || !mgr.setVoice(voice)) {
       await interaction.reply({
         content: 'Live-сессия не запущена — сначала `/join`.',
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
-    mgr.setVoice(voice);
     await interaction.reply(
       `Голос: **${voice}**. Пару секунд на пересоздание сессии (контекст разговора сбросится).`,
     );
@@ -162,8 +162,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: 'Я и так не в канале.', flags: MessageFlags.Ephemeral });
       return;
     }
-    connection.destroy();
-    liveSessions.delete(interaction.guild.id);
+    connection.destroy(); // live-сессия погаснет сама через stateChange=destroyed
     await interaction.reply('Вышел.');
   }
 });
