@@ -1,5 +1,5 @@
 import { PassThrough } from 'node:stream';
-import { GoogleGenAI, Modality, StartSensitivity, ActivityHandling } from '@google/genai';
+import { GoogleGenAI, Modality, StartSensitivity } from '@google/genai';
 import prism from 'prism-media';
 import {
   createAudioPlayer,
@@ -128,9 +128,8 @@ class LiveSessionManager {
         // короткие всплески (кашель, смешок, «ага») не коммитились как начало речи
         // и не дёргали модель. Хвост речи (prefix) сервер сохраняет — начало не теряется.
         realtimeInputConfig: {
-          // Начала говорить — договаривает: речь людей не обрывает ответ (barge-in выключен).
-          // Голосом её теперь не остановить, только /leave или дождаться конца реплики.
-          activityHandling: ActivityHandling.NO_INTERRUPTION,
+          // Barge-in включён (дефолт START_OF_ACTIVITY_INTERRUPTS): устойчивая речь
+          // обрывает ответ. Фильтр от случайных обрывов — динамический гейт в микшере.
           automaticActivityDetection: {
             startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
             prefixPaddingMs: 300,
@@ -378,11 +377,14 @@ export async function startLive(connection, apiKey) {
   const inputs = new Map(); // userId -> { rest, queue, gateFrames, passed } (см. гейт ниже)
   const MAX_QUEUE = 50; // ~1с на юзера: декодер бурстит, тикер разгребает в реальном темпе
 
-  // Шумовой порог: кадры юзера не идут в Gemini, пока он не наговорил MIN_SPEECH_FRAMES
-  // подряд (~240мс). Всплеск горячего микрофона при заходе в канал (дыхание, клава)
-  // умирает, не дойдя до сервера, — иначе STT галлюцинирует на нём фантомные фразы
-  // (видели японский в логах). Прошедшая порог речь досылается целиком — начало не режется.
+  // Двухрежимный гейт (кадры юзера не идут в Gemini, пока не набран порог непрерывной речи;
+  // накопленное затем досылается целиком — начало не режется):
+  // - бот молчит: 240мс — шумовой фильтр. Всплеск горячего микрофона при заходе в канал
+  //   умирает, не дойдя до сервера, — иначе STT галлюцинирует фантомные фразы (видели японский).
+  // - бот говорит: 600мс — фильтр перебивания (практика LiveKit interrupt_speech_duration):
+  //   кашель и «ага» ответ не обрывают, устойчивая речь — обрывает через ~0.9с.
   const MIN_SPEECH_FRAMES = 12;
+  const GATE_INTERRUPT_FRAMES = 30;
 
   const userInput = (userId) => {
     let u = inputs.get(userId);
@@ -458,6 +460,21 @@ export async function startLive(connection, apiKey) {
     decoder.on('error', onStreamError);
   });
 
+  // Дыра старого гейта: кто говорил ДО начала её ответа, имел passed=true и обходил
+  // фильтр перебивания — в галдеже это каждый первый, отсюда «перебивается постоянно».
+  // Теперь на старте каждого хода пропуска сгорают: все проходят 600мс-испытание заново.
+  player.on('stateChange', (oldS, newS) => {
+    if (
+      oldS.status === AudioPlayerStatus.Buffering &&
+      newS.status === AudioPlayerStatus.Playing
+    ) {
+      for (const u of inputs.values()) {
+        u.passed = false;
+        u.gateFrames = 0;
+      }
+    }
+  });
+
   // Soft-limiter вместо жёсткого клампа (как в микшере WebRTC): при перегрузе весь фрейм
   // умножается на общий коэффициент — пропорции громкости голосов сохраняются, вместо
   // хруста от среза по потолку. Атака мгновенная, отпускание плавное (~5% за фрейм),
@@ -470,11 +487,13 @@ export async function startLive(connection, apiKey) {
   const mixTimer = setInterval(() => {
     limiterGain = Math.min(1, limiterGain * RELEASE);
 
+    const botSpeaking = player.state.status === AudioPlayerStatus.Playing;
+
     const frames = [];
     for (const [userId, u] of inputs) {
       if (u.queue.length) {
         if (!u.passed) {
-          if (u.gateFrames < MIN_SPEECH_FRAMES) {
+          if (u.gateFrames < (botSpeaking ? GATE_INTERRUPT_FRAMES : MIN_SPEECH_FRAMES)) {
             // Испытательный срок: копим кадры в очереди, в микс не пускаем
             u.gateFrames++;
             continue;
