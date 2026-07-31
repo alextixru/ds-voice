@@ -181,7 +181,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const arg = interaction.options.getString('имя');
     const mgr = getLiveSession(interaction.guild.id);
     if (!arg) {
-      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Autonoe');
+      const current = mgr ? mgr.voiceName : (process.env.VOICE_NAME || 'Leda');
       await interaction.reply({
         content: `Сейчас: **${current}**. Смена: \`/voice имя:<голос>\`\nДоступные: ${VOICES.join(', ')}`,
         flags: MessageFlags.Ephemeral,

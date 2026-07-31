@@ -83,7 +83,7 @@ class LiveSessionManager {
     this.attempt = 0;
     this.reconnectTimer = null;
     this.speechSinceServerMsg = 0; // watchdog-счётчик
-    this.voiceName = process.env.VOICE_NAME || 'Autonoe';
+    this.voiceName = process.env.VOICE_NAME || 'Leda';
     this.epoch = 0; // растёт с каждым коннектом: колбэки прошлых сессий отсеиваются
   }
 
