@@ -180,8 +180,10 @@ class LiveSessionManager {
         contextWindowCompression: { slidingWindow: {} },
         // Сервер выдаёт handle; при реконнекте передаём его — контекст разговора сохраняется
         sessionResumption: this.handle ? { handle: this.handle } : {},
-        // googleSearch — встроенный поиск: даёт ей знание о текущих событиях
-        tools: [{ googleSearch: {} }, { functionDeclarations: TOOL_DECLARATIONS }],
+        // ВНИМАНИЕ: googleSearch сюда не добавлять — у grounding-поиска отдельная квота,
+        // которой на free tier нет: сессия падает 1011 quota прямо на setup (проверено
+        // изолированным тестом 2026-08-01). Вернуть можно после включения биллинга.
+        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
       },
       callbacks: {
         onopen: () => console.log('live: session open'),
