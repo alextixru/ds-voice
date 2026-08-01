@@ -158,7 +158,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
-      await startLive(joined.connection, process.env.GEMINI_API_KEY);
+      await startLive(joined.connection, process.env.GEMINI_API_KEY, {
+        // Уведомления (смена голоса и т.п.) — в канал, откуда позвали бота
+        announce: (text) => interaction.channel?.send(text).catch(() => {}),
+      });
     } catch (e) {
       console.error('startLive failed:', e);
       // Соединение могло уже погибнуть (гонка параллельных /join) — повторный destroy кинет

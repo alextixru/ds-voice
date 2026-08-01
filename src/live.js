@@ -124,6 +124,7 @@ class LiveSessionManager {
     this.speechSinceServerMsg = 0; // watchdog-счётчик
     this.voiceName = process.env.VOICE_NAME || 'Leda';
     this.epoch = 0; // растёт с каждым коннектом: колбэки прошлых сессий отсеиваются
+    this.announceVoiceOnReady = null; // имя голоса, которым надо представиться после реконнекта
   }
 
   // Смена голоса на лету: новый voiceName применяется только при новой сессии,
@@ -134,6 +135,7 @@ class LiveSessionManager {
     if (this.stopped) return false;
     this.voiceName = name;
     this.handle = null;
+    this.announceVoiceOnReady = name; // после реконнекта попросим её отметиться новым голосом
     console.log(`live: смена голоса на ${name}, пересоздаю сессию`);
     this.#reconnectNow();
     return true;
@@ -200,6 +202,13 @@ class LiveSessionManager {
     // никто не снимет — а залипший true проглотит следующий реальный обрыв.
     this.expectClose = false;
     this.#flushQueue();
+    // Смена голоса прошла — пусть представится новым тембром, иначе смена «немая»
+    // (новая сессия молчит, пока к ней не обратятся)
+    if (this.announceVoiceOnReady) {
+      const name = this.announceVoiceOnReady;
+      this.announceVoiceOnReady = null;
+      this.sendText(`[тебе только что сменили голос на ${name} — скажи пару слов новым голосом, похвастайся]`);
+    }
   }
 
   #onMessage(msg) {
@@ -377,7 +386,8 @@ export function getLiveSession(guildId) {
 
 // ---- основной запуск ----
 
-export async function startLive(connection, apiKey) {
+// opts.announce?: (text) => void — сообщение в текстовый канал (уведомления о смене голоса и т.п.)
+export async function startLive(connection, apiKey, opts = {}) {
   const player = createAudioPlayer({
     behaviors: {
       noSubscriber: NoSubscriberBehavior.Pause,
@@ -442,6 +452,7 @@ export async function startLive(connection, apiKey) {
         const name = VOICES.find((v) => v.toLowerCase() === want.toLowerCase());
         if (!name) return `нет голоса «${want}». Есть: ${VOICES.join(', ')}`;
         setTimeout(() => mgr.setVoice(name), 500);
+        opts.announce?.(`🔊 Голос сменён голосовой командой: **${name}**`);
         return `голос сменится на ${name} через секунду (контекст разговора сбросится)`;
       }
       case 'shut_up': {
