@@ -158,7 +158,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
-      await startLive(joined.connection, process.env.GEMINI_API_KEY);
+      await startLive(joined.connection, process.env.GEMINI_API_KEY, {
+        // Живые люди в текущем канале бота (кэш точен благодаря GuildVoiceStates).
+        // Берём канал из voice-state самого бота — переживает перенос в другой канал.
+        countHumans: () => {
+          const channel = interaction.guild.members.me?.voice?.channel;
+          if (!channel) return 0;
+          return channel.members.filter((m) => !m.user.bot).size;
+        },
+      });
     } catch (e) {
       console.error('startLive failed:', e);
       // Соединение могло уже погибнуть (гонка параллельных /join) — повторный destroy кинет
