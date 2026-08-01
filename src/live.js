@@ -33,13 +33,17 @@ const TOOL_DECLARATIONS = [
   },
   {
     name: 'shut_up',
-    description: 'Замолчать и не слушать канал указанное время. Вызывай, когда просят замолчать, помолчать, заткнуться.',
+    description: 'Замолчать на указанное время (слушать продолжаешь). Вызывай, когда просят замолчать, помолчать, заткнуться.',
     parameters: {
       type: 'OBJECT',
       properties: {
         minutes: { type: 'NUMBER', description: 'Сколько минут молчать; если не сказали — 5' },
       },
     },
+  },
+  {
+    name: 'unmute',
+    description: 'Снять свой мьют и снова говорить. Вызывай, когда тебя зовут обратно: «вернись», «можешь говорить», «расчехляйся», «хватит молчать».',
   },
 ];
 
@@ -407,9 +411,17 @@ export async function startLive(connection, apiKey) {
         setTimeout(() => {
           mutedUntil = Date.now() + minutes * 60_000;
           stopPlayback();
-          console.log(`live: замолкла на ${minutes} мин`);
+          console.log(`live: замолкла на ${minutes} мин (слушать продолжает)`);
         }, 2000);
-        return `молчишь ${minutes} мин: подтверди одним коротким словом`;
+        return `молчишь ${minutes} мин (но слушаешь; позовут — вызови unmute): подтверди одним коротким словом`;
+      }
+      case 'unmute': {
+        if (Date.now() < mutedUntil) {
+          mutedUntil = 0;
+          console.log('live: мьют снят голосом');
+          return 'мьют снят, можешь говорить — коротко отметься';
+        }
+        return 'ты и не молчала';
       }
       default:
         return `неизвестный инструмент ${fc.name}`;
@@ -567,16 +579,8 @@ export async function startLive(connection, apiKey) {
   const mixTimer = setInterval(() => {
     limiterGain = Math.min(1, limiterGain * RELEASE);
 
-    // Мьют: канал не слушаем (иначе после мьюта прорвался бы накопленный бэклог),
-    // в сессию идёт тишина, чтобы она не считалась брошенной
-    if (Date.now() < mutedUntil) {
-      for (const u of inputs.values()) {
-        u.queue.length = 0;
-        u.rest = Buffer.alloc(0);
-      }
-      mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
-      return;
-    }
+    // Мьют глушит только её голос (onAudio), слух остаётся: аудио канала продолжает
+    // идти в сессию, поэтому «Ханами, вернись» она услышит и снимет мьют инструментом.
 
     const botSpeaking = player.state.status === AudioPlayerStatus.Playing;
 
