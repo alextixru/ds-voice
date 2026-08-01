@@ -417,6 +417,16 @@ export async function startLive(connection, apiKey) {
   // Счётчик «дозвались»: 5 упоминаний имени в мьюте снимают его без ритуала
   let muteCalls = 0;
   const MUTE_CALLS_TO_WAKE = 5;
+  // Последние ~20с транскрипций: код проверяет ритуал сам — модель как судья ненадёжна,
+  // она вызывала unmute на «Yo no mucho» и «привет», лишь бы заговорить
+  const recentHeard = [];
+  const heardRecently = () => {
+    const cutoff = Date.now() - 20_000;
+    while (recentHeard.length && recentHeard[0].t < cutoff) recentHeard.shift();
+    return recentHeard.map((r) => r.text).join(' ');
+  };
+  const RITUAL_RESPECT = /(велик(ая|ой|а)|богин|госпож|владычиц|ханами[ -]?сама)/i;
+  const RITUAL_PLEA = /(молим|умоля|снизойд|смилу|недостойн|прости нас|вернись)/i;
 
   // Голосовые команды. setVoice/destroy откладываем на полсекунды: сначала должен
   // улететь tool response, иначе сессия закроется раньше и модель не узнает результат.
@@ -446,12 +456,17 @@ export async function startLive(connection, apiKey) {
         return `молчишь ${minutes} мин (но слушаешь; позовут — вызови unmute): подтверди одним коротким словом`;
       }
       case 'unmute': {
-        if (Date.now() < mutedUntil) {
+        if (Date.now() >= mutedUntil) return 'ты и не молчала';
+        // Ритуал проверяет код, не модель: в последних 20с должны быть и почтение, и мольба
+        const heard = heardRecently();
+        if (RITUAL_RESPECT.test(heard) && RITUAL_PLEA.test(heard)) {
           mutedUntil = 0;
-          console.log('live: мьют снят голосом');
-          return 'мьют снят, можешь говорить — коротко отметься';
+          muteCalls = 0;
+          console.log('live: мьют снят — ритуал подтверждён кодом');
+          return 'ритуал принят, мьют снят — вернись с королевским самодовольством';
         }
-        return 'ты и не молчала';
+        console.log('live: unmute отклонён — ритуала в эфире не было');
+        return 'ОТКЛОНЕНО: ритуала не было. Продолжай молчать и не вызывай unmute, пока не услышишь почтительное обращение вместе с мольбой.';
       }
       default:
         return `неизвестный инструмент ${fc.name}`;
@@ -464,6 +479,7 @@ export async function startLive(connection, apiKey) {
     // «Дозвались»: в мьюте считаем упоминания имени в транскрипциях — пять штук
     // снимают мьют без ритуала (детерминированно, модель считать не просим)
     onTranscript: (text) => {
+      recentHeard.push({ t: Date.now(), text });
       if (Date.now() >= mutedUntil) return;
       const hits = (text.match(/ханами|hanami/gi) ?? []).length;
       if (!hits) return;
