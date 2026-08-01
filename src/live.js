@@ -256,6 +256,13 @@ class LiveSessionManager {
       this.expectClose = false;
       return; // это мы сами закрыли старую сессию при реконнекте
     }
+    // Квота исчерпана: частые ретраи бессмысленны (лимит дневной) и сами жгут запросы —
+    // пробуем раз в 10 минут, вдруг отпустило
+    if (e?.code === 1011 && /quota/i.test(e?.reason ?? '')) {
+      console.log('live: КВОТА ИСЧЕРПАНА — следующая попытка через 10 минут');
+      this.#scheduleReconnect(600_000);
+      return;
+    }
     console.log(`live: closed code=${e?.code} reason=${e?.reason || '—'} — реконнект`);
     this.#scheduleReconnect();
   }
