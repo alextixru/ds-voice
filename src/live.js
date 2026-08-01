@@ -13,6 +13,36 @@ import { SYSTEM_INSTRUCTION } from './persona.js';
 
 const MODEL = 'gemini-3.1-flash-live-preview';
 
+// Голосовые команды: модель сама вызывает инструмент, когда её просят словами.
+// Обработчики — в startLive (там есть connection и плеер), сюда только декларации.
+const TOOL_DECLARATIONS = [
+  {
+    name: 'leave_channel',
+    description: 'Выйти из голосового канала. Вызывай, когда тебя просят выйти, уйти, отключиться, свалить.',
+  },
+  {
+    name: 'set_voice',
+    description: 'Сменить твой голос на другой. Вызывай, когда просят сменить/поменять голос.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        voice: { type: 'STRING', description: 'Имя голоса, например Kore, Leda, Puck, Charon' },
+      },
+      required: ['voice'],
+    },
+  },
+  {
+    name: 'shut_up',
+    description: 'Замолчать и не слушать канал указанное время. Вызывай, когда просят замолчать, помолчать, заткнуться.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        minutes: { type: 'NUMBER', description: 'Сколько минут молчать; если не сказали — 5' },
+      },
+    },
+  },
+];
+
 // 30 предустановленных голосов Live API (регистр важен для API, матчим без учёта)
 export const VOICES = [
   'Zephyr', 'Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Enceladus', 'Leda',
@@ -141,6 +171,7 @@ class LiveSessionManager {
         contextWindowCompression: { slidingWindow: {} },
         // Сервер выдаёт handle; при реконнекте передаём его — контекст разговора сохраняется
         sessionResumption: this.handle ? { handle: this.handle } : {},
+        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
       },
       callbacks: {
         onopen: () => console.log('live: session open'),
@@ -161,6 +192,16 @@ class LiveSessionManager {
 
   #onMessage(msg) {
     this.speechSinceServerMsg = 0; // сервер жив
+
+    if (msg.toolCall?.functionCalls?.length) {
+      const responses = this.handlers.onToolCall?.(msg.toolCall.functionCalls) ?? [];
+      try {
+        this.session.sendToolResponse({ functionResponses: responses });
+      } catch (e) {
+        console.error('tool response error:', e.message);
+      }
+      return;
+    }
 
     // Пока идёт наш собственный реконнект (смена голоса и т.п.), апдейты от умирающей
     // сессии игнорируем: setVoice обнулил handle, и запоздалый update вернул бы его —
@@ -341,8 +382,45 @@ export async function startLive(connection, apiKey) {
     }
   });
 
+  // «Замолчи на N минут»: пока не истекло — её ответы в мусор, канал не слушаем
+  let mutedUntil = 0;
+
+  // Голосовые команды. setVoice/destroy откладываем на полсекунды: сначала должен
+  // улететь tool response, иначе сессия закроется раньше и модель не узнает результат.
+  const runTool = (fc) => {
+    console.log(`live: tool call ${fc.name}`, JSON.stringify(fc.args ?? {}));
+    switch (fc.name) {
+      case 'leave_channel': {
+        setTimeout(() => { try { connection.destroy(); } catch {} }, 2500);
+        return 'ок, выходишь через пару секунд — коротко попрощайся';
+      }
+      case 'set_voice': {
+        const want = String(fc.args?.voice ?? '');
+        const name = VOICES.find((v) => v.toLowerCase() === want.toLowerCase());
+        if (!name) return `нет голоса «${want}». Есть: ${VOICES.join(', ')}`;
+        setTimeout(() => mgr.setVoice(name), 500);
+        return `голос сменится на ${name} через секунду (контекст разговора сбросится)`;
+      }
+      case 'shut_up': {
+        const minutes = Math.max(0.5, Math.min(120, Number(fc.args?.minutes) || 5));
+        // 2 секунды на короткое подтверждение голосом, потом мьют
+        setTimeout(() => {
+          mutedUntil = Date.now() + minutes * 60_000;
+          stopPlayback();
+          console.log(`live: замолкла на ${minutes} мин`);
+        }, 2000);
+        return `молчишь ${minutes} мин: подтверди одним коротким словом`;
+      }
+      default:
+        return `неизвестный инструмент ${fc.name}`;
+    }
+  };
+
   const mgr = new LiveSessionManager(apiKey, {
+    onToolCall: (calls) =>
+      calls.map((fc) => ({ id: fc.id, name: fc.name, response: { result: runTool(fc) } })),
     onAudio: (pcm24k) => {
+      if (Date.now() < mutedUntil) return; // молчим — ответы не воспроизводим
       const pcm48k = upsample24kMonoTo48kStereo(pcm24k);
       if (!currentTurn) {
         console.log('live: модель начала отвечать, стартую воспроизведение');
@@ -488,6 +566,17 @@ export async function startLive(connection, apiKey) {
   // Единый «микрофон» бота: 50 фреймов/с, микс всех говорящих либо тишина
   const mixTimer = setInterval(() => {
     limiterGain = Math.min(1, limiterGain * RELEASE);
+
+    // Мьют: канал не слушаем (иначе после мьюта прорвался бы накопленный бэклог),
+    // в сессию идёт тишина, чтобы она не считалась брошенной
+    if (Date.now() < mutedUntil) {
+      for (const u of inputs.values()) {
+        u.queue.length = 0;
+        u.rest = Buffer.alloc(0);
+      }
+      mgr.sendAudioChunk(SILENCE_CHUNK_16K, false);
+      return;
+    }
 
     const botSpeaking = player.state.status === AudioPlayerStatus.Playing;
 
