@@ -304,9 +304,7 @@ export function getLiveSession(guildId) {
 
 // ---- основной запуск ----
 
-// opts.countHumans?: () => number — сколько живых людей (не ботов) сейчас в войс-канале;
-// live.js про Discord-сущности не знает, счёт делает вызывающий.
-export async function startLive(connection, apiKey, opts = {}) {
+export async function startLive(connection, apiKey) {
   const player = createAudioPlayer({
     behaviors: {
       noSubscriber: NoSubscriberBehavior.Pause,
@@ -377,9 +375,7 @@ export async function startLive(connection, apiKey, opts = {}) {
   const receiver = connection.receiver;
   const active = new Set();
   const inputs = new Map(); // userId -> { rest, queue, gateFrames, passed } (см. гейт ниже)
-  // ~3с буфера на юзера: у прошедших гейт очередь и так дренируется каждый тик, кап работает
-  // только на «удержанных» — в режиме толпы храним хвост их речи, чтобы дослать после реплики
-  const MAX_QUEUE = 150;
+  const MAX_QUEUE = 50; // ~1с на юзера: декодер бурстит, тикер разгребает в реальном темпе
 
   // Двухрежимный гейт (кадры юзера не идут в Gemini, пока не набран порог непрерывной речи;
   // накопленное затем досылается целиком — начало не режется):
@@ -387,15 +383,9 @@ export async function startLive(connection, apiKey, opts = {}) {
   //   умирает, не дойдя до сервера, — иначе STT галлюцинирует фантомные фразы (видели японский).
   // - бот говорит: 600мс — фильтр перебивания (практика LiveKit interrupt_speech_duration):
   //   кашель и «ага» ответ не обрывают, устойчивая речь — обрывает через ~0.9с.
-  // - бот говорит И в канале толпа (>CROWD_LIMIT людей): перебить нельзя вообще — чужое
-  //   аудио на сервер не уходит, пока она не договорит. В галдеже перебивания токсичны:
-  //   любой фоновый трёп длиннее гейта рубил бы её на полуслове. Хвост удержанной речи
-  //   (до ~3с на человека) досылается после реплики штатным backlog-флашем — контекст
-  //   не слепнет. Досылы идут последовательно по юзерам, не миксом: для дожатия контекста
-  //   это ок, а случай «двое непрерывно говорили всю её реплику» редкий.
+  //   Перебить можно всегда, независимо от числа людей в канале.
   const MIN_SPEECH_FRAMES = 12;
   const GATE_INTERRUPT_FRAMES = 30;
-  const CROWD_LIMIT = 4; // >4 человек — толпа, перебивания выключаются
 
   const userInput = (userId) => {
     let u = inputs.get(userId);
@@ -494,23 +484,17 @@ export async function startLive(connection, apiKey, opts = {}) {
   const RELEASE = 1.05;
   let limiterGain = 1;
 
-  // Счёт людей в канале — раз в секунду, а не каждый тик (фильтр по кэшу участников)
-  let crowd = 0;
-  let tick = 0;
-
   // Единый «микрофон» бота: 50 фреймов/с, микс всех говорящих либо тишина
   const mixTimer = setInterval(() => {
     limiterGain = Math.min(1, limiterGain * RELEASE);
-    if (tick++ % 50 === 0) crowd = opts.countHumans?.() ?? 0;
 
     const botSpeaking = player.state.status === AudioPlayerStatus.Playing;
-    const gateWhileSpeaking = crowd > CROWD_LIMIT ? Infinity : GATE_INTERRUPT_FRAMES;
 
     const frames = [];
     for (const [userId, u] of inputs) {
       if (u.queue.length) {
         if (!u.passed) {
-          if (u.gateFrames < (botSpeaking ? gateWhileSpeaking : MIN_SPEECH_FRAMES)) {
+          if (u.gateFrames < (botSpeaking ? GATE_INTERRUPT_FRAMES : MIN_SPEECH_FRAMES)) {
             // Испытательный срок: копим кадры в очереди, в микс не пускаем
             u.gateFrames++;
             continue;
