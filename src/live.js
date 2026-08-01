@@ -180,7 +180,8 @@ class LiveSessionManager {
         contextWindowCompression: { slidingWindow: {} },
         // Сервер выдаёт handle; при реконнекте передаём его — контекст разговора сохраняется
         sessionResumption: this.handle ? { handle: this.handle } : {},
-        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+        // googleSearch — встроенный поиск: даёт ей знание о текущих событиях
+        tools: [{ googleSearch: {} }, { functionDeclarations: TOOL_DECLARATIONS }],
       },
       callbacks: {
         onopen: () => console.log('live: session open'),
@@ -230,6 +231,7 @@ class LiveSessionManager {
 
     if (sc.inputTranscription?.text) {
       console.log('live: услышано ->', sc.inputTranscription.text);
+      this.handlers.onTranscript?.(sc.inputTranscription.text);
     }
     if (sc.interrupted) {
       console.log('live: interrupted (barge-in)');
@@ -297,6 +299,16 @@ class LiveSessionManager {
         this.#scheduleReconnect();
       }
     }, wait);
+  }
+
+  // Служебный текст в живую сессию (подсказки при снятии мьюта и т.п.)
+  sendText(text) {
+    if (!this.ready) return;
+    try {
+      this.session.sendRealtimeInput({ text });
+    } catch (e) {
+      console.error('send text error:', e.message);
+    }
   }
 
   // isSpeech=false для чанков тишины: их не буферизуем и watchdog по ним не считаем
@@ -391,8 +403,11 @@ export async function startLive(connection, apiKey) {
     }
   });
 
-  // «Замолчи на N минут»: пока не истекло — её ответы в мусор, канал не слушаем
+  // «Замолчи на N минут»: пока не истекло — её ответы в мусор (слушать продолжает)
   let mutedUntil = 0;
+  // Счётчик «дозвались»: 5 упоминаний имени в мьюте снимают его без ритуала
+  let muteCalls = 0;
+  const MUTE_CALLS_TO_WAKE = 5;
 
   // Голосовые команды. setVoice/destroy откладываем на полсекунды: сначала должен
   // улететь tool response, иначе сессия закроется раньше и модель не узнает результат.
@@ -415,6 +430,7 @@ export async function startLive(connection, apiKey) {
         // 2 секунды на короткое подтверждение голосом, потом мьют
         setTimeout(() => {
           mutedUntil = Date.now() + minutes * 60_000;
+          muteCalls = 0;
           stopPlayback();
           console.log(`live: замолкла на ${minutes} мин (слушать продолжает)`);
         }, 2000);
@@ -436,6 +452,23 @@ export async function startLive(connection, apiKey) {
   const mgr = new LiveSessionManager(apiKey, {
     onToolCall: (calls) =>
       calls.map((fc) => ({ id: fc.id, name: fc.name, response: { result: runTool(fc) } })),
+    // «Дозвались»: в мьюте считаем упоминания имени в транскрипциях — пять штук
+    // снимают мьют без ритуала (детерминированно, модель считать не просим)
+    onTranscript: (text) => {
+      if (Date.now() >= mutedUntil) return;
+      const hits = (text.match(/ханами|hanami/gi) ?? []).length;
+      if (!hits) return;
+      muteCalls += hits;
+      console.log(`live: в мьюте позвали по имени (${muteCalls}/${MUTE_CALLS_TO_WAKE})`);
+      if (muteCalls >= MUTE_CALLS_TO_WAKE) {
+        muteCalls = 0;
+        mutedUntil = 0;
+        console.log('live: мьют снят — дозвались');
+        mgr.sendText(
+          '[мьют снят: тебя позвали по имени пять раз — возвращайся в разговор; можешь побурчать, что задолбали]',
+        );
+      }
+    },
     onAudio: (pcm24k) => {
       if (Date.now() < mutedUntil) return; // молчим — ответы не воспроизводим
       const pcm48k = upsample24kMonoTo48kStereo(pcm24k);
