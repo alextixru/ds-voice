@@ -68,6 +68,22 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Готов: ${c.user.tag}, слэш-команды зарегистрированы, allowlist: ${GUILD_ALLOWLIST.size} гильдий`);
 });
 
+// deferReply не идемпотентен, а REST discord.js ретраит таймауты: при лаге сети первый
+// запрос доходит (Discord показывает «думает…»), ретрай получает 40060 «already
+// acknowledged» — interaction на самом деле подтверждён, можно продолжать (editReply
+// сработает). 10062 «unknown interaction» — не уложились в 3с, interaction мёртв.
+// Без этого throw из deferReply убивал весь обработчик /join — вечное «думает…».
+async function safeDefer(interaction) {
+  try {
+    await interaction.deferReply();
+    return true;
+  } catch (e) {
+    if (e?.code === 40060) return true;
+    console.error(`deferReply (${interaction.commandName}) не прошёл:`, e?.message ?? e);
+    return false;
+  }
+}
+
 // interaction должен быть deferred: entersState ждёт до 15с, а на ответ даётся 3с
 async function joinChannel(interaction) {
   const channel = interaction.member?.voice?.channel;
@@ -128,7 +144,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isAutocomplete()) {
     const q = interaction.options.getFocused().toLowerCase();
     const matches = VOICES.filter((v) => v.toLowerCase().includes(q)).slice(0, 25);
-    await interaction.respond(matches.map((v) => ({ name: v, value: v })));
+    // Автокомплит живёт секунды и дублируется на каждый ввод символа — опоздавший
+    // или повторённый ретраем ответ (10062/40060) просто игнорируем
+    await interaction.respond(matches.map((v) => ({ name: v, value: v }))).catch(() => {});
     return;
   }
 
@@ -154,7 +172,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
-    await interaction.deferReply();
+    if (!(await safeDefer(interaction))) return;
     const joined = await joinChannel(interaction);
     if (!joined) return;
     try {
@@ -173,7 +191,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.commandName === 'echo') {
-    await interaction.deferReply();
+    if (!(await safeDefer(interaction))) return;
     const joined = await joinChannel(interaction);
     if (!joined) return;
     startEcho(joined.connection);
