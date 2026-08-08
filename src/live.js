@@ -425,6 +425,8 @@ export function getLiveSession(guildId) {
 // ---- основной запуск ----
 
 // opts.announce?: (text) => void — сообщение в текстовый канал (уведомления о смене голоса и т.п.)
+// opts.resolveSpeakerName?: (userId) => string | null — как звать говорящего; live.js про
+// Discord-сущности не знает, имя достаёт вызывающий.
 export async function startLive(connection, apiKey, opts = {}) {
   const player = createAudioPlayer({
     behaviors: {
@@ -629,6 +631,27 @@ export async function startLive(connection, apiKey, opts = {}) {
     return u;
   };
 
+  // Ник в метке автора. NFKC разворачивает декоративные юникод-шрифты (𝔐𝔞𝔫𝔢𝔨𝔦 → Maneki),
+  // дальше оставляем только буквы/цифры/пробел/._- : эмодзи и рамки для модели мусор,
+  // а [ ] сломали бы саму разметку.
+  const speakerName = (userId) => {
+    const raw = opts.resolveSpeakerName?.(userId);
+    if (!raw) return null;
+    const clean = String(raw)
+      .normalize('NFKC')
+      .replace(/[^\p{L}\p{N} ._-]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 24);
+    return clean || null;
+  };
+
+  // Последний помеченный автор: метка шлётся только при его смене. Каждая метка —
+  // реалтайм-стимул для модели (в tap-логе видно, как на серию голых меток она
+  // отвечала пустыми ходами), поэтому их должно быть как можно меньше: закрывающих
+  // нет вовсе, подряд идущие реплики одного человека новых меток не плодят.
+  let lastLabeledSpeaker = null;
+
   // Декодер не обязан отдавать ровно по 20 мс — накапливаем и режем на фреймы
   const pushAudio = (userId, pcm16k) => {
     const u = userInput(userId);
@@ -719,6 +742,17 @@ export async function startLive(connection, apiKey, opts = {}) {
             continue;
           }
           u.passed = true;
+          // Метка автора: API не умеет диаризацию, размечаем сами. Шлём ровно в момент,
+          // когда звук реплики реально идёт к модели, — всплеск, умерший в гейте, метку
+          // не дёргает (реализация с меткой на speaking start путала авторов: кашель
+          // без звука перевешивал чужую речь на кашлюна).
+          if (userId !== lastLabeledSpeaker) {
+            const name = speakerName(userId);
+            if (name) {
+              lastLabeledSpeaker = userId;
+              mgr.sendText(`[${name}]`);
+            }
+          }
           // Порог пройден — досылаем накопленное начало реплики одним куском,
           // чтобы первый слог («Ха» из «Ханами») не пропал
           const backlog = u.queue.splice(0);

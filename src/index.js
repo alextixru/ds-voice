@@ -186,6 +186,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await startLive(joined.connection, process.env.GEMINI_API_KEY, {
         // Уведомления (смена голоса и т.п.) — в канал, откуда позвали бота
         announce: (text) => interaction.channel?.send(text).catch(() => {}),
+        // Говорящий всегда в войсе гильдии, а GuildVoiceStates держит таких в кэше
+        resolveSpeakerName: (userId) =>
+          interaction.guild.members.cache.get(userId)?.displayName ?? null,
       });
     } catch (e) {
       console.error('startLive failed:', e);
