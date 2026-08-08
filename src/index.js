@@ -78,7 +78,14 @@ async function safeDefer(interaction) {
     await interaction.deferReply();
     return true;
   } catch (e) {
-    if (e?.code === 40060) return true;
+    if (e?.code === 40060) {
+      // discord.js проверяет СВОЙ локальный флаг перед editReply — раз наш deferReply
+      // не прошёл, флаг не выставлен, и editReply упал бы с InteractionNotReplied,
+      // хотя на сервере interaction подтверждён. Выставляем вручную.
+      interaction.deferred = true;
+      console.log(`deferReply (${interaction.commandName}): 40060 — кто-то подтвердил interaction раньше нас, продолжаю`);
+      return true;
+    }
     console.error(`deferReply (${interaction.commandName}) не прошёл:`, e?.message ?? e);
     return false;
   }
