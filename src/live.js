@@ -268,6 +268,13 @@ class LiveSessionManager {
       this.#scheduleReconnect(600_000);
       return;
     }
+    // Гео-блок: Google не нравится выходной IP (обычно слетел/сменился сервер VPN).
+    // Само не рассосётся, пока не сменят маршрут — не устраиваем реконнект-шторм
+    if (e?.code === 1007 && /location is not supported/i.test(e?.reason ?? '')) {
+      console.log('live: ГЕО-БЛОК (location not supported) — проверь VPN; попытка через 10 минут');
+      this.#scheduleReconnect(600_000);
+      return;
+    }
     console.log(`live: closed code=${e?.code} reason=${e?.reason || '—'} — реконнект`);
     this.#scheduleReconnect();
   }
