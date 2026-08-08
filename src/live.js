@@ -1,5 +1,8 @@
 import { PassThrough } from 'node:stream';
+import fs from 'node:fs';
 import { GoogleGenAI, Modality, StartSensitivity, ActivityHandling } from '@google/genai';
+import { WebSocket } from 'ws';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import prism from 'prism-media';
 import {
   createAudioPlayer,
@@ -102,6 +105,31 @@ const FRAME_16K = 320 * 2;
 // нужен непрерывный поток, чтобы засечь конец реплики — добиваем тишину сами по таймеру.
 const SILENCE_CHUNK_16K = Buffer.alloc(FRAME_16K);
 
+// Копия NodeWebSocket из SDK, но с agent: SDK прокси не умеет, а Google блокирует
+// выходной IP VPN («user location is not supported») — весь трафик к Gemini идёт
+// через отдельный прокси из GEMINI_PROXY.
+class ProxiedWebSocket {
+  constructor(url, headers, callbacks, agent) {
+    this.url = url;
+    this.headers = headers;
+    this.callbacks = callbacks;
+    this.agent = agent;
+  }
+  connect() {
+    this.ws = new WebSocket(this.url, { headers: this.headers, agent: this.agent });
+    this.ws.onopen = this.callbacks.onopen;
+    this.ws.onerror = this.callbacks.onerror;
+    this.ws.onclose = this.callbacks.onclose;
+    this.ws.onmessage = this.callbacks.onmessage;
+  }
+  send(message) {
+    this.ws.send(message);
+  }
+  close() {
+    this.ws.close();
+  }
+}
+
 // ---- менеджер Live-сессии с авто-переподключением ----
 //
 // Переживает: GoAway (проактивный реконнект), внезапный close (реконнект с backoff),
@@ -112,6 +140,15 @@ class LiveSessionManager {
   constructor(apiKey, handlers) {
     // v1alpha: proactivity (проактивное аудио) в стабильной версии API ещё не доступна
     this.ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
+    // webSocketFactory — публичное свойство Live: подменяем на фабрику с прокси-агентом,
+    // Discord и остальной трафик это не трогает
+    if (process.env.GEMINI_PROXY) {
+      const agent = new HttpsProxyAgent(process.env.GEMINI_PROXY);
+      this.ai.live.webSocketFactory = {
+        create: (url, headers, callbacks) => new ProxiedWebSocket(url, headers, callbacks, agent),
+      };
+      console.log('live: трафик к Gemini идёт через прокси из GEMINI_PROXY');
+    }
     this.handlers = handlers; // { onAudio(pcm24k), onTurnComplete() }
     this.session = null;
     this.ready = false;
@@ -528,6 +565,40 @@ export async function startLive(connection, apiKey, opts = {}) {
       }
     },
   });
+  // Отладочный отвод (DEBUG_TAP=1 в .env): пишет в logs/tap-<время>.pcm ровно тот
+  // аудиопоток, что слышит модель (16kHz mono s16le, с тишиной — шкала времени
+  // настоящая), а в logs/tap-<время>.log — текстовые события с миллисекундами:
+  // метки авторов, что модель расслышала, когда отвечала, tool calls.
+  // Послушать: ffmpeg -f s16le -ar 16000 -ac 1 -i tap-*.pcm tap.wav
+  let tap = null;
+  if (process.env.DEBUG_TAP) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const pcm = fs.createWriteStream(`logs/tap-${stamp}.pcm`);
+    const evt = fs.createWriteStream(`logs/tap-${stamp}.log`);
+    const t0 = Date.now();
+    let lastKind = '';
+    const ev = (kind, line) => {
+      if (kind === 'speak' && lastKind === 'speak') return; // не спамим по чанку ответа
+      lastKind = kind;
+      evt.write(`${String(Date.now() - t0).padStart(8, ' ')}ms ${line}\n`);
+    };
+    const origAudio = mgr.sendAudioChunk.bind(mgr);
+    mgr.sendAudioChunk = (buf, isSpeech) => { pcm.write(buf); return origAudio(buf, isSpeech); };
+    const origText = mgr.sendText.bind(mgr);
+    mgr.sendText = (text) => { ev('text', `К НЕЙ (текст): ${text}`); return origText(text); };
+    const h = mgr.handlers;
+    const wrapH = (name, kind, fmt) => {
+      const orig = h[name];
+      h[name] = (...args) => { ev(kind, fmt(...args)); return orig?.(...args); };
+    };
+    wrapH('onTranscript', 'hear', (text) => `РАССЛЫШАЛА: "${text}"`);
+    wrapH('onAudio', 'speak', () => 'ОТВЕЧАЕТ (аудио пошло)');
+    wrapH('onTurnComplete', 'turn', () => '— ход завершён —');
+    wrapH('onToolCall', 'tool', (calls) => `TOOL CALL: ${calls.map((c) => c.name).join(', ')}`);
+    tap = { close: () => { pcm.end(); evt.end(); } };
+    console.log(`live: DEBUG_TAP пишет в logs/tap-${stamp}.{pcm,log}`);
+  }
+
   await mgr.start();
 
   // ---- захват микрофонов канала + микшер ----
@@ -696,6 +767,7 @@ export async function startLive(connection, apiKey, opts = {}) {
       clearInterval(mixTimer);
       stopPlayback();
       mgr.stop();
+      tap?.close();
     }
   });
 
